@@ -1,0 +1,294 @@
+# Production-ready docker compose
+version: '3.9'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: vault-backend
+    ports:
+      - "5000:5000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - FLASK_ENV=production
+      - DATABASE_URL=sqlite:///vault.db
+      - PII_REDACTION_MODEL=presidio
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./backend/vault.db:/app/vault.db
+      - ./backend/logs:/app/logs
+    command: python main.py
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - vault-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: vault-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://backend:5000/api/v1
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - vault-network
+    restart: unless-stopped
+
+networks:
+  vault-network:
+    driver: bridge
+
+volumes:
+  db-data:
+    driver: local
+
+---
+
+# backend/Dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Download spaCy model
+RUN python -m spacy download en_core_web_sm
+
+# Copy application
+COPY . .
+
+# Expose port
+EXPOSE 5000
+
+# Health check
+HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
+    CMD curl -f http://localhost:5000/health || exit 1
+
+CMD ["python", "main.py"]
+
+---
+
+# frontend/Dockerfile
+FROM node:18-alpine as builder
+
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:18-alpine
+
+WORKDIR /app
+RUN npm install -g serve
+
+COPY --from=builder /app/dist ./dist
+
+EXPOSE 3000
+
+CMD ["serve", "-s", "dist", "-l", "3000"]
+
+---
+
+# .env.example (copy to .env and fill in)
+OPENAI_API_KEY=sk-proj-YOUR-KEY-HERE
+FLASK_ENV=production
+DATABASE_URL=sqlite:///vault.db
+PII_REDACTION_MODEL=presidio
+LOG_LEVEL=INFO
+
+# Optional: For encryption
+ENCRYPTION_KEY=your-32-char-encryption-key-here
+
+---
+
+# Quick Start Guide
+
+## Option 1: Docker (Recommended)
+
+```bash
+# 1. Clone repository
+git clone <repo-url>
+cd rent-vs-buy-vault
+
+# 2. Copy environment file
+cp .env.example .env
+# Edit .env and add your OPENAI_API_KEY
+
+# 3. Build and run
+docker-compose up --build
+
+# 4. Access services
+# Frontend: http://localhost:3000
+# Backend: http://localhost:5000
+# Health: http://localhost:5000/health
+```
+
+## Option 2: Local Development
+
+```bash
+# Terminal 1: Backend
+cd backend
+python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+python -m spacy download en_core_web_sm
+python main.py
+
+# Terminal 2: Frontend
+cd frontend
+npm install
+npm run dev
+```
+
+---
+
+# Testing
+
+## Unit Tests (Backend)
+
+```bash
+cd backend
+pytest tests/ -v
+```
+
+## API Testing with cURL
+
+```bash
+# 1. Create session
+curl -X POST http://localhost:5000/api/v1/session/create
+
+# 2. Upload document (requires file)
+curl -X POST http://localhost:5000/api/v1/upload \
+  -F "session_id=<session-id>" \
+  -F "file=@salary_slip.jpg"
+
+# 3. Send chat message
+curl -X POST http://localhost:5000/api/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "<session-id>", "message": "Tell me about buying"}'
+
+# 4. Run analysis
+curl -X POST http://localhost:5000/api/v1/analyze \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session_id": "<session-id>",
+    "monthly_salary": 25000,
+    "current_rent": 5000
+  }'
+
+# 5. Capture lead
+curl -X POST http://localhost:5000/api/v1/lead/capture \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session_id": "<session-id>",
+    "lead_data": {
+      "monthly_salary": 25000,
+      "current_rent": 5000,
+      "property_preference": "JVC Villas",
+      "timeline": "Next 3 months"
+    }
+  }'
+```
+
+---
+
+# Production Deployment
+
+## AWS EC2
+
+```bash
+# Launch instance (Ubuntu 22.04)
+# Install Docker
+curl -fsSL https://get.docker.com -o get-docker.sh
+sudo sh get-docker.sh
+
+# Clone repo
+git clone <repo-url>
+cd rent-vs-buy-vault
+
+# Configure
+cp .env.example .env
+nano .env  # Add OPENAI_API_KEY
+
+# Run
+docker-compose up -d
+
+# View logs
+docker-compose logs -f backend
+```
+
+## Environment Variables (Production)
+
+```
+OPENAI_API_KEY=sk-proj-... (from OpenAI)
+FLASK_ENV=production
+DATABASE_URL=postgresql://user:pass@db:5432/vault (upgrade from SQLite)
+PII_REDACTION_MODEL=presidio
+LOG_LEVEL=WARNING (less verbose)
+SECRET_KEY=<random-32-char-secret> (change from default)
+ENCRYPTION_KEY=<32-char-base64-key> (for data encryption)
+```
+
+## Scaling Considerations
+
+1. **Replace SQLite**: Use PostgreSQL for concurrent requests
+2. **Redis Session Store**: Replace in-memory sessions
+3. **Load Balancing**: Use Nginx/ALB for multiple backend instances
+4. **CDN**: CloudFront for frontend assets
+5. **API Rate Limiting**: Flask-Limiter to prevent abuse
+6. **Monitoring**: DataDog/New Relic for metrics
+
+---
+
+# Troubleshooting
+
+## Issue: "OPENAI_API_KEY not set"
+**Solution**: Check .env file, ensure key is exported
+```bash
+export OPENAI_API_KEY=sk-proj-...
+```
+
+## Issue: "Port 5000 already in use"
+**Solution**: Change port in docker-compose.yml or kill process
+```bash
+lsof -i :5000
+kill -9 <PID>
+```
+
+## Issue: spaCy model not found
+**Solution**: Download model manually
+```bash
+python -m spacy download en_core_web_sm
+```
+
+## Issue: PII detection is slow
+**Solution**: Presidio loads on first run. Subsequent calls are cached.
+
+---
+
+# Performance Optimization Tips
+
+1. **Cache Vision Extractions**: Don't re-extract same document
+2. **Batch Analysis**: Analyze multiple users in one batch
+3. **CDN for Frontend**: Serve JS/CSS from CloudFront
+4. **Database Indexing**: Index session_id, lead_id, captured_at
+5. **LLM Caching**: Cache common LLM responses
